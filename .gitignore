@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual Environment
+.env
+.venv
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Trading Data
+*.log
+log/
+logs/
+*.csv
+data/
+backtest_results/
+
+# Personal Configuration
+config.ini
+secrets.py
+api_keys.py
+
+# OS
+Thumbs.db
+.DS_Store

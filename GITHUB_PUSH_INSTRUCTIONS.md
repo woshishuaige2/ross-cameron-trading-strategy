@@ -28,8 +28,8 @@ Open PowerShell and run these commands:
 # Navigate to the repository
 cd "C:\Users\china\OneDrive\Desktop\12 Week Plan\Algo trading\ibkr\ross-cameron-trading-strategy"
 
-# Add remote (replace YOUR_USERNAME with your GitHub username)
-git remote add origin https://github.com/YOUR_USERNAME/ross-cameron-trading-strategy.git
+# Add remote
+git remote add origin https://github.com/woshishuaige2/ross-cameron-trading-strategy.git
 
 # Rename branch to main
 git branch -M main
@@ -40,7 +40,7 @@ git push -u origin main
 
 ### 3. Verify Upload
 
-Go to: https://github.com/YOUR_USERNAME/ross-cameron-trading-strategy
+Go to: https://github.com/woshishuaige2/ross-cameron-trading-strategy
 
 You should see:
 - ✅ README.md with full documentation
@@ -99,7 +99,7 @@ If prompted for credentials:
 ### Issue: Remote already exists
 ```powershell
 git remote remove origin
-git remote add origin https://github.com/YOUR_USERNAME/ross-cameron-trading-strategy.git
+git remote add origin https://github.com/woshishuaige2/ross-cameron-trading-strategy.git
 ```
 
 ### Issue: Authentication failed

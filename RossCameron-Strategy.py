@@ -55,8 +55,8 @@ class StrategyConfig:
     RECENT_HIGH_LOOKBACK = 15        # Check for high in last 15 bars
     
     # Volume Analysis
-    MIN_RELATIVE_VOLUME = 1.5         # Minimum 1.5x average volume for entry (Ross Cameron style)
-    VOLUME_SPIKE_THRESHOLD = 2.0     # Volume must be < 2x average to avoid topping
+    MIN_RELATIVE_VOLUME = 2.0         # Minimum 2.0x average volume for entry (Ross Cameron style)
+    VOLUME_SPIKE_THRESHOLD = 2.5     # Volume must be < 2.5x average to avoid topping
     VOLUME_WICK_RATIO = 1.5           # Upper wick vs body ratio for topping detection
     MAX_RED_CANDLES_IN_PULLBACK = 4   # Maximum red candles allowed in last 5 bars
     VOLUME_LOOKBACK_BARS = 10         # Bars to analyze for volume
@@ -79,12 +79,16 @@ class StrategyConfig:
     PREMARKET_START_MINUTE = 0
     MARKET_OPEN_HOUR = 9              # 9:30 AM
     MARKET_OPEN_MINUTE = 30
-    MARKET_CLOSE_HOUR = 15            # 3:50 PM
-    MARKET_CLOSE_MINUTE = 50
+    MARKET_CLOSE_HOUR = 15            # 3:59 PM
+    MARKET_CLOSE_MINUTE = 59
     
     # Exit Timing (same as market close)
-    END_OF_DAY_HOUR = 15              # 3 PM
-    END_OF_DAY_MINUTE = 50            # 3:50 PM
+    END_OF_DAY_HOUR = 15              # 3:59 PM
+    END_OF_DAY_MINUTE = 59            # 3:59 PM
+    
+    # VWAP Reset Times
+    VWAP_PREMARKET_RESET_HOUR = 4     # 4:00 AM - VWAP resets for premarket
+    VWAP_PREMARKET_RESET_MINUTE = 0
     
     # VWAP Lookback
     VWAP_LOOKBACK_BARS = 390          # Session VWAP (from 9:30 AM market open)
@@ -394,18 +398,18 @@ def check_above_vwap(bars, current_price):
     - bars: List of bar dictionaries for VWAP calculation
     - current_price: Current price to compare
     
-    Returns: (bool, str) - (condition_met, message)
+    Returns: (bool, str, float) - (condition_met, message, vwap_value)
     """
     vwap = calculate_vwap(bars)
     
     if vwap is None:
-        return False, "VWAP calculation failed"
+        return False, "VWAP calculation failed", 0.0
     
     if current_price <= vwap:
-        return False, f"Price below VWAP: ${current_price:.4f} <= ${vwap:.4f} (no long entry)"
+        return False, f"Price below VWAP: ${current_price:.4f} <= ${vwap:.4f} (no long entry)", vwap
     
     pct_above = ((current_price - vwap) / vwap) * 100
-    return True, f"Price above VWAP: ${current_price:.4f} > ${vwap:.4f} (+{pct_above:.2f}%)"
+    return True, f"Price above VWAP: ${current_price:.4f} > ${vwap:.4f} (+{pct_above:.2f}%)", vwap
 
 
 def check_all_entry_conditions(bars_1m, current_price):
@@ -422,14 +426,14 @@ def check_all_entry_conditions(bars_1m, current_price):
     pattern_ok, pattern_msg, pullback_low, recent_high = detect_pullback_and_new_high(bars_1m)
     macd_ok, macd_msg = check_macd_positive(bars_1m)
     volume_ok, volume_msg = check_volume_conditions(bars_1m)
-    vwap_ok, vwap_msg = check_above_vwap(bars_1m, current_price)
+    vwap_ok, vwap_msg, vwap_value = check_above_vwap(bars_1m, current_price)
     
-    # Compile results
+    # Compile results (include vwap_value for debugging)
     results = {
         'pattern': {'ok': pattern_ok, 'msg': pattern_msg},
         'macd': {'ok': macd_ok, 'msg': macd_msg},
         'volume': {'ok': volume_ok, 'msg': volume_msg},
-        'vwap': {'ok': vwap_ok, 'msg': vwap_msg}
+        'vwap': {'ok': vwap_ok, 'msg': vwap_msg, 'vwap_value': vwap_value}
     }
     
     all_ok = pattern_ok and macd_ok and volume_ok and vwap_ok

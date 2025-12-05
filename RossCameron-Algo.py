@@ -92,12 +92,13 @@ class TradingAlgo(EClient, EWrapper):
         self.entry_price = {}  # track actual entry price per symbol
         self.stop_price = {}  # track stop loss price per symbol
         self.profit_target_price = {}  # track profit target price per symbol
-        self.oca_group = {}  # track OCA group per symbol (for One-Cancels-All exit orders)
         self.brackets_added_at_open = {}  # track if brackets were added at market open for pre-market positions
         self.current_symbol = None  # track which symbol is being processed
         self.current_reqid = None  # track which request ID is being processed
         self.vwap_cache = {}  # cached VWAP value per symbol
         self.vwap_last_update = {}  # timestamp of last VWAP update per symbol
+        self.entry_timestamp = {}  # track entry timestamp for each symbol (for trailing stop)
+        self.highest_high_since_entry = {}  # track highest high reached after entry (for trailing stop)
         
     def nextValidId(self, orderId: OrderId):
         self.oid = orderId
@@ -203,6 +204,11 @@ class TradingAlgo(EClient, EWrapper):
                     self.pending_entry[symbol] = False
                     self.position[symbol] = int(filled)
                     self.entry_price[symbol] = avgFillPrice
+                    # Track entry time for trailing stop calculation
+                    est = timezone(timedelta(hours=-5))
+                    self.entry_timestamp[symbol] = datetime.now(est)
+                    # Initialize highest high to entry price
+                    self.highest_high_since_entry[symbol] = avgFillPrice
                     print(f"✓✓✓ ENTRY FILLED ({symbol}): {self.position[symbol]} shares @ ${avgFillPrice}")
                     
                     # If filled during regular hours but was a pre-market order, immediately add stop/profit orders
@@ -253,6 +259,10 @@ class TradingAlgo(EClient, EWrapper):
                     del self.stop_price[symbol]
                 if symbol in self.profit_target_price:
                     del self.profit_target_price[symbol]
+                if symbol in self.entry_timestamp:
+                    del self.entry_timestamp[symbol]
+                if symbol in self.highest_high_since_entry:
+                    del self.highest_high_since_entry[symbol]
                 
                 print(f"✓✓✓ POSITION CLOSED ({symbol}) @ ${execution.price}")
 
@@ -339,8 +349,9 @@ def check_and_trade(app, contract, symbol):
     if symbol not in app.premarket_entry:
         app.premarket_entry[symbol] = False
     
-    # Don't check if already in position OR pending entry
-    if app.in_position[symbol] or app.pending_entry[symbol]:
+    # CRITICAL: Check in_position FIRST before any data fetching to prevent duplicate orders
+    # This prevents race condition where multiple calls enter before first order fills
+    if app.in_position.get(symbol, False):
         # Get current price for display
         app.current_symbol = symbol
         if symbol in app.last_price:
@@ -350,10 +361,6 @@ def check_and_trade(app, contract, symbol):
         app.cancelMktData(1)
         
         current_price = app.last_price.get(symbol, 0)
-        
-        # Return appropriate status
-        if app.pending_entry[symbol]:
-            return {"symbol": symbol, "status": "PENDING ENTRY", "skip": True, "price": current_price}
         
         # Return position details for display
         entry = app.entry_price.get(symbol, 0)
@@ -371,12 +378,12 @@ def check_and_trade(app, contract, symbol):
             "quantity": qty
         }
     
-    # Check for stale pending orders (over 5 minutes old) and cancel them
-    if app.pending_entry[symbol]:
+    # Check for stale pending orders (over 5 minutes old) and cancel them FIRST
+    if app.pending_entry.get(symbol, False):
         if symbol in app.pending_entry_time:
             elapsed = time.time() - app.pending_entry_time[symbol]
             if elapsed > 300:  # 5 minutes
-                print(f"\n[WARNING] Stale pending order for {symbol} ({elapsed:.0f}s old) - cancelling...")
+                print(f"[WARNING] Stale pending order for {symbol} ({elapsed:.0f}s old) - cancelling")
                 if symbol in app.entry_order_id:
                     app.cancelOrder(app.entry_order_id[symbol])
                     del app.entry_order_id[symbol]
@@ -389,7 +396,9 @@ def check_and_trade(app, contract, symbol):
                     del app.stop_price[symbol]
                 if symbol in app.profit_target_price:
                     del app.profit_target_price[symbol]
+                # Continue to check for new entry after cancelling stale order
             else:
+                # Still within 5 minutes, keep waiting
                 return {"symbol": symbol, "status": "PENDING ENTRY", "skip": True}
         else:
             return {"symbol": symbol, "status": "PENDING ENTRY", "skip": True}
@@ -412,30 +421,19 @@ def check_and_trade(app, contract, symbol):
         bars_count = len(app.bars.get(symbol, []))
         return {"symbol": symbol, "status": "INSUFFICIENT DATA", "bars": bars_count, "skip": True}
     
-    # Check if we need to refresh VWAP (only every 60 seconds)
-    current_time = time.time()
-    need_vwap_refresh = True
+    # CRITICAL: Always refresh VWAP to prevent stale values from allowing trades below VWAP
+    # Get 1-minute bars for VWAP on every check
+    if symbol in app.bars_1min:
+        app.bars_1min[symbol] = []
     
-    if symbol in app.vwap_last_update:
-        time_since_update = current_time - app.vwap_last_update[symbol]
-        if time_since_update < 60:  # Less than 60 seconds since last update
-            need_vwap_refresh = False
+    duration_1min = StrategyConfig.DATA_DURATION_1MIN
+    bar_size_1min = StrategyConfig.BAR_SIZE_1MIN
+    app.reqHistoricalData(4002, contract, end_time, duration_1min, bar_size_1min, "TRADES", 1, 1, False, [])
+    time.sleep(3)
     
-    # Get 1-minute bars for VWAP only if needed (slow refresh)
-    if need_vwap_refresh:
-        if symbol in app.bars_1min:
-            app.bars_1min[symbol] = []
-        
-        duration_1min = StrategyConfig.DATA_DURATION_1MIN
-        bar_size_1min = StrategyConfig.BAR_SIZE_1MIN
-        app.reqHistoricalData(4002, contract, end_time, duration_1min, bar_size_1min, "TRADES", 1, 1, False, [])
-        time.sleep(3)
-        
-        if symbol not in app.bars_1min or len(app.bars_1min[symbol]) < 10:
-            bars_count = len(app.bars_1min.get(symbol, []))
-            return {"symbol": symbol, "status": "INSUFFICIENT 1M DATA", "bars": bars_count, "skip": True}
-        
-        app.vwap_last_update[symbol] = current_time
+    if symbol not in app.bars_1min or len(app.bars_1min[symbol]) < 10:
+        bars_count = len(app.bars_1min.get(symbol, []))
+        return {"symbol": symbol, "status": "INSUFFICIENT 1M DATA", "bars": bars_count, "skip": True}
     
     # Get current ask price first for VWAP check
     if symbol in app.ask_price:
@@ -449,22 +447,32 @@ def check_and_trade(app, contract, symbol):
     
     current_price = app.ask_price[symbol]
     
-    # Filter 1-min bars for session VWAP (same logic as backtest)
+    # Filter 1-min bars for VWAP calculation with session-specific reset times
     est = timezone(timedelta(hours=-5))
     now_est = datetime.now(est)
-    market_open = now_est.replace(hour=9, minute=30, second=0, microsecond=0)
+    today_date = now_est.date()  # Get today's date only (no time)
     
     # Validate bars have datetime objects (should be set in historicalData callback)
     if not all(isinstance(b.get('date'), datetime) for b in app.bars_1min[symbol]):
         return {"symbol": symbol, "status": "INVALID BAR DATES", "skip": True}
     
-    if now_est.hour < 9 or (now_est.hour == 9 and now_est.minute < 30):
-        # Pre-market: use all available bars (no filtering needed)
-        filtered_bars_1m = app.bars_1min[symbol]
+    # Determine VWAP reset time based on current trading session
+    # PREMARKET (5:00 AM - 9:29 AM): VWAP resets at 4:00 AM
+    # REGULAR HOURS (9:30 AM - 3:59 PM): VWAP resets at 9:30 AM
+    if is_premarket():
+        # Premarket: Use bars from 4:00 AM onwards
+        vwap_reset_time = now_est.replace(hour=4, minute=0, second=0, microsecond=0)
+        session_name = "PREMARKET"
     else:
-        # Regular hours: use ONLY bars >= 9:30 AM TODAY for session VWAP
-        # Compare actual datetime objects, not just hour/minute (to exclude pre-market)
-        filtered_bars_1m = [b for b in app.bars_1min[symbol] if b['date'] >= market_open]
+        # Regular hours: Use bars from 9:30 AM onwards
+        vwap_reset_time = now_est.replace(hour=9, minute=30, second=0, microsecond=0)
+        session_name = "REGULAR"
+    
+    # Filter to bars from TODAY only, starting at appropriate reset time
+    filtered_bars_1m = [
+        b for b in app.bars_1min[symbol] 
+        if b['date'].date() == today_date and b['date'] >= vwap_reset_time
+    ]
     
     if len(filtered_bars_1m) < 10:
         return {"symbol": symbol, "status": "INSUFFICIENT SESSION DATA", "bars": len(filtered_bars_1m), "skip": True}
@@ -484,6 +492,9 @@ def check_and_trade(app, contract, symbol):
     volume_msg = results.get('volume', {}).get('msg', "")
     vwap_ok = results.get('vwap', {}).get('ok', False)
     vwap_msg = results.get('vwap', {}).get('msg', "")
+    
+    # Get VWAP value for display
+    vwap_value = results.get('vwap', {}).get('vwap_value', 0)
 
     
     # Return status for display
@@ -494,6 +505,7 @@ def check_and_trade(app, contract, symbol):
         "macd": "✓" if macd_ok else "✗",
         "volume": "✓" if volume_ok else "✗",
         "vwap": "✓" if vwap_ok else "✗",
+        "vwap_value": vwap_value,  # Include VWAP value for display
         "all_pass": pattern_ok and macd_ok and volume_ok and vwap_ok,
         "skip": False
     }
@@ -507,7 +519,7 @@ def check_and_trade(app, contract, symbol):
         result["skip"] = True
         return result
     
-    # All conditions met - place trade!
+    # All conditions met - prepare for trade!
     timestamp = datetime.now().strftime('%H:%M:%S')
     
     print(f"\n{'='*70}")
@@ -531,12 +543,35 @@ def check_and_trade(app, contract, symbol):
         result["skip"] = True
         return result
     
+    # Check if pre-market hours (needed for entry price calculation)
+    in_premarket = is_premarket()
+    
+    # Get current EST time for debugging
+    est = timezone(timedelta(hours=-5))
+    now_est = datetime.now(est)
+    current_time_str = now_est.strftime('%H:%M:%S')
+    
     # Calculate entry/exit prices using shared strategy module
-    entry_price, stop_price, profit_price = calculate_entry_exit_prices(
-        app.ask_price[symbol], 
-        pullback_low_price,
-        recent_high_price
-    )
+    # In pre-market, use ASK directly (no spread) to ensure fill with limit order
+    current_price_for_calc = app.ask_price[symbol]
+    
+    if in_premarket:
+        # Pre-market: use ASK directly (no spread) with outsideRth enabled
+        entry_price = round(current_price_for_calc, 2)  # At ASK price
+        # Calculate stop/profit using normal logic
+        breakout_pct = ((entry_price - recent_high_price) / recent_high_price) * 100 if recent_high_price else 0
+        if breakout_pct > 10.0:
+            stop_price = round(recent_high_price * 0.99, 2)
+        else:
+            stop_price = round(pullback_low_price * 0.99, 2)
+        profit_price = round(entry_price * (1 + StrategyConfig.PROFIT_TARGET_PCT), 2)
+    else:
+        # Regular hours: use normal spread calculation
+        entry_price, stop_price, profit_price = calculate_entry_exit_prices(
+            current_price_for_calc, 
+            pullback_low_price,
+            recent_high_price
+        )
     
     # Validate that we got valid prices
     if entry_price is None or stop_price is None or profit_price is None:
@@ -577,11 +612,20 @@ def check_and_trade(app, contract, symbol):
     print(f"  Entry: ${entry_price} | Stop: ${stop_price} ({stop_type}, -{stop_pct_actual:.1f}%) | Target: ${profit_price} (+{StrategyConfig.PROFIT_TARGET_PCT*100:.0f}%)")
     print(f"  Quantity: {qty} shares | Notional: ${notional:.2f} | Risk: ${risk_dollars:.2f} ({risk_pct_actual:.1f}%)\n")
     
-    # Check if pre-market hours
-    in_premarket = is_premarket()
+    # CRITICAL: Final defensive check before placing order (race condition protection)
+    # Check again if we entered position during data fetching/validation
+    if app.in_position.get(symbol, False) or app.pending_entry.get(symbol, False):
+        result["status"] = "RACE CONDITION PREVENTED"
+        result["skip"] = True
+        return result
+    
+    # CRITICAL: Set pending_entry flag NOW after all validation passes, right before building orders
+    # This prevents race condition where second call enters before first completes order placement
+    app.pending_entry[symbol] = True
+    app.pending_entry_time[symbol] = time.time()
     
     if in_premarket:
-        print(f"⚠️  PRE-MARKET MODE: Stop loss will be monitored manually with limit orders\n")
+        print(f"⚠️  PRE-MARKET MODE: Entry at ASK ${entry_price}, stop loss monitored manually\n")
     
     # Build bracket orders
     parent = Order()
@@ -591,6 +635,7 @@ def check_and_trade(app, contract, symbol):
     parent.totalQuantity = qty
     parent.tif = "DAY"
     parent.transmit = True  # Always transmit entry order
+    parent.outsideRth = True  # CRITICAL: Allow premarket/afterhours trading
     try:
         parent.eTradeOnly = False
         parent.firmQuoteOnly = False
@@ -653,17 +698,11 @@ def check_and_trade(app, contract, symbol):
         app.stop_order_id[symbol] = stop_id
         app.profit_order_active[symbol] = True  # Mark as active when placed
         app.stop_order_active[symbol] = True    # Mark as active when placed
-        
-        print(f"[DEBUG] OCA group '{oca_group_name}' created for {symbol} bracket orders")
-        
-        print(f"[DEBUG] Bracket orders for {symbol}: Profit ID={profit_id}, Stop ID={stop_id}, both marked ACTIVE")
     
     parent.orderId = parent_id
     
-    # Set tracking BEFORE placing orders to prevent race conditions
+    # Set entry order tracking (pending_entry already set at top of trade logic)
     app.entry_order_id[symbol] = parent_id
-    app.pending_entry[symbol] = True
-    app.pending_entry_time[symbol] = time.time()  # Track when order was placed
     
     if in_premarket:
         app.premarket_entry[symbol] = True
@@ -884,8 +923,8 @@ if __name__ == "__main__":
                 
                 # Display results table
                 if results:
-                    print(f"{'Symbol':<8} {'Price':<10} {'Pattern':<10} {'MACD':<8} {'Volume':<10} {'VWAP':<8} {'Status':<20}")
-                    print(f"{'-'*70}")
+                    print(f"{'Symbol':<8} {'Price':<10} {'Pattern':<10} {'MACD':<8} {'Volume':<10} {'VWAP':<8} {'VWAP $':<10} {'Status':<20}")
+                    print(f"{'-'*90}")
                     
                     for r in results:
                         if r.get('skip'):
@@ -906,11 +945,13 @@ if __name__ == "__main__":
                                 print(f"{r['symbol']:<8} IN POSITION - Last:${current:.2f} {pnl_str}")
                                 print(f"         Entry:${entry:.2f} | Stop:${stop:.2f} | Target:${profit:.2f} | Qty:{qty}")
                             else:
-                                print(f"{r['symbol']:<8} {'-':<10} {'-':<10} {'-':<8} {'-':<10} {'-':<8} {status:<20}")
+                                print(f"{r['symbol']:<8} {'-':<10} {'-':<10} {'-':<8} {'-':<10} {'-':<8} {'-':<10} {status:<20}")
                         else:
                             price_str = f"${r.get('price', 0):.2f}"
+                            vwap_val = r.get('vwap_value', 0)
+                            vwap_str = f"${vwap_val:.2f}" if vwap_val > 0 else "-"
                             status = "✓ SIGNAL!" if r.get('all_pass') else "Waiting..."
-                            print(f"{r['symbol']:<8} {price_str:<10} {r.get('pattern', '-'):<10} {r.get('macd', '-'):<8} {r.get('volume', '-'):<10} {r.get('vwap', '-'):<8} {status:<20}")
+                            print(f"{r['symbol']:<8} {price_str:<10} {r.get('pattern', '-'):<10} {r.get('macd', '-'):<8} {r.get('volume', '-'):<10} {r.get('vwap', '-'):<8} {vwap_str:<10} {status:<20}")
                     
                     print(f"\n{'='*70}")
                     print(f"Monitoring... (updates on change, Ctrl+C to stop)")
@@ -940,6 +981,7 @@ if __name__ == "__main__":
                             profit_taker.lmtPrice = profit_price
                             profit_taker.totalQuantity = qty
                             profit_taker.tif = "GTC"
+                            profit_taker.transmit = False
                             
                             # Stop loss
                             stop_loss = Order()
@@ -948,6 +990,7 @@ if __name__ == "__main__":
                             stop_loss.auxPrice = stop_price
                             stop_loss.totalQuantity = qty
                             stop_loss.tif = "GTC"
+                            stop_loss.transmit = True
                             
                             profit_id = app.nextOid()
                             stop_id = app.nextOid()
@@ -970,6 +1013,11 @@ if __name__ == "__main__":
             
             # Monitor active positions for dynamic exit (Candle Under Candle)
             for symbol in symbols:
+                # CRITICAL: Check if position still exists before starting exit monitoring
+                # If bracket orders already filled, skip entire exit monitoring loop
+                if not app.in_position.get(symbol, False) or app.position.get(symbol, 0) <= 0:
+                    continue
+                
                 if symbol in app.in_position and app.in_position[symbol]:
                     
                     # CRITICAL: Check if this is a pre-market position that needs stop loss added NOW
@@ -1024,15 +1072,12 @@ if __name__ == "__main__":
                             print(f"{'='*70}\n")
                             time.sleep(1)
                     
-                    # Request fresh 10-second bar data for exit monitoring
+                    # Request fresh 10-second bar data for exit monitoring (faster response than 1-min)
                     app.current_symbol = symbol
                     
-                    # Don't clear bars - accumulate them (keep last 100 bars for better pattern detection)
-                    if symbol not in app.bars:
+                    # Get fresh 10-second bars for exit monitoring
+                    if symbol in app.bars:
                         app.bars[symbol] = []
-                    
-                    # Clear and fetch fresh data to get latest bars
-                    app.bars[symbol] = []
                     
                     end_time = ""
                     duration = StrategyConfig.DATA_DURATION_10SEC
@@ -1040,11 +1085,28 @@ if __name__ == "__main__":
                     app.reqHistoricalData(4001, contracts[symbol], end_time, duration, bar_size, "TRADES", 1, 1, False, [])
                     time.sleep(3)
                     
-                    # Debug: Check how many bars we received
+                    # Check how many bars we received
                     bar_count = len(app.bars.get(symbol, []))
                     if bar_count < 2:
-                        print(f"[WARNING] {symbol}: Only {bar_count} bars received for exit monitoring. Skipping dynamic exit check.")
                         continue
+                    
+                    # Filter to bars AFTER entry timestamp for trailing stop calculation
+                    entry_time = app.entry_timestamp.get(symbol)
+                    if entry_time:
+                        bars_since_entry = [
+                            b for b in app.bars[symbol]
+                            if b['date'] >= entry_time
+                        ]
+                    else:
+                        # Fallback if no entry timestamp
+                        bars_since_entry = app.bars[symbol]
+                    
+                    # Update highest high reached since entry (for trailing stop)
+                    if len(bars_since_entry) > 0:
+                        current_highest = max(b['high'] for b in bars_since_entry)
+                        previous_highest = app.highest_high_since_entry.get(symbol, app.entry_price.get(symbol, 0))
+                        if current_highest > previous_highest:
+                            app.highest_high_since_entry[symbol] = current_highest
                     
                     # PRE-MARKET: Monitor stop loss and profit target with limit orders
                     if is_premarket() and symbol in app.premarket_entry and app.premarket_entry.get(symbol, False):
@@ -1076,6 +1138,7 @@ if __name__ == "__main__":
                                 stop_order.lmtPrice = current_bid
                                 stop_order.totalQuantity = app.position[symbol]
                                 stop_order.tif = "DAY"
+                                stop_order.outsideRth = True  # Allow premarket trading
                                 
                                 stop_id = app.nextOid()
                                 stop_order.orderId = stop_id
@@ -1114,6 +1177,7 @@ if __name__ == "__main__":
                                 profit_order.lmtPrice = current_bid
                                 profit_order.totalQuantity = app.position[symbol]
                                 profit_order.tif = "DAY"
+                                profit_order.outsideRth = True  # Allow premarket trading
                                 
                                 profit_id = app.nextOid()
                                 profit_order.orderId = profit_id
@@ -1148,10 +1212,6 @@ if __name__ == "__main__":
                         print(f"Entry: ${app.entry_price.get(symbol, 0):.2f}")
                         print(f"Adding stop loss (${app.stop_price.get(symbol, 0):.2f}) and profit target (${app.profit_target_price.get(symbol, 0):.2f})...")
                         
-                        # Create OCA group for brackets
-                        oca_group_name = f"OCA_{symbol}_{int(time.time())}"
-                        app.oca_group[symbol] = oca_group_name
-                        
                         # Profit target order
                         profit_taker = Order()
                         profit_taker.action = "SELL"
@@ -1159,9 +1219,7 @@ if __name__ == "__main__":
                         profit_taker.lmtPrice = app.profit_target_price[symbol]
                         profit_taker.totalQuantity = app.position[symbol]
                         profit_taker.tif = "GTC"
-                        profit_taker.transmit = True  # Must transmit to exchange
-                        profit_taker.ocaGroup = oca_group_name
-                        profit_taker.ocaType = 1
+                        profit_taker.transmit = False
                         try:
                             profit_taker.eTradeOnly = False
                             profit_taker.firmQuoteOnly = False
@@ -1176,8 +1234,6 @@ if __name__ == "__main__":
                         stop_loss.totalQuantity = app.position[symbol]
                         stop_loss.tif = "GTC"
                         stop_loss.transmit = True
-                        stop_loss.ocaGroup = oca_group_name
-                        stop_loss.ocaType = 1
                         try:
                             stop_loss.eTradeOnly = False
                             stop_loss.firmQuoteOnly = False
@@ -1201,91 +1257,85 @@ if __name__ == "__main__":
                         app.stop_order_active[symbol] = True
                         app.brackets_added_at_open[symbol] = True
                         
-                        print(f"✓ Bracket orders placed with OCA group: {oca_group_name}")
+                        print(f"✓ Bracket orders placed (inherent OCA)")
                         print(f"  Profit order ID: {profit_id}")
                         print(f"  Stop order ID: {stop_id}")
                         print(f"{'='*70}\n")
                         time.sleep(1)
                     
-                    # Check for dynamic exit signal (Candle Under Candle) using shared strategy module
-                    bars_for_check = app.bars.get(symbol, [])
+                    # Check for dynamic exit signal (Candle Under Candle)
+                    bars_for_check = bars_since_entry if len(bars_since_entry) >= 2 else app.bars.get(symbol, [])
                     
-                    # Debug logging: Show bar data before checking
-                    if len(bars_for_check) >= 2:
-                        latest = bars_for_check[-1]
-                        previous = bars_for_check[-2]
-                        print(f"[DEBUG] {symbol} Exit Check: {len(bars_for_check)} bars | Previous low: ${previous['low']:.2f} | Latest low: ${latest['low']:.2f} | Diff: ${latest['low'] - previous['low']:.2f}")
+                    if len(bars_for_check) < 2:
+                        continue
                     
                     should_exit, exit_msg = check_dynamic_exit(bars_for_check)
                     
                     if should_exit and app.position.get(symbol, 0) > 0:
-                        # CRITICAL CHECK: Only process dynamic exit if we still control the position
-                        # If bracket orders already executed, skip dynamic exit
-                        has_active_brackets = (app.stop_order_active.get(symbol, False) or 
-                                             app.profit_order_active.get(symbol, False))
+                        # TRAILING STOP: Only exit if we've made at least 5% peak gain
+                        # This locks in profits after reaching 5% gain, prevents early exits on noise
+                        entry_price = app.entry_price.get(symbol, 0)
+                        highest_high = app.highest_high_since_entry.get(symbol, entry_price)
+                        peak_gain_pct = ((highest_high - entry_price) / entry_price * 100) if entry_price > 0 else 0
                         
-                        print(f"[DEBUG] {symbol} Dynamic exit triggered! Bracket orders active: Stop={app.stop_order_active.get(symbol, False)}, Profit={app.profit_order_active.get(symbol, False)}")
+                        # Require at least 5% peak gain before triggering trailing stop
+                        if peak_gain_pct < 5.0:
+                            continue
                         
-                        # In pre-market, no brackets exist so always allow dynamic exit
-                        # In regular hours, only if brackets are still active (not filled yet)
-                        if is_premarket() or has_active_brackets:
-                            timestamp = datetime.now().strftime('%H:%M:%S')
-                            print(f"\n{'='*70}")
-                            print(f"[{timestamp}] 🔴 DYNAMIC EXIT TRIGGERED - {symbol}")
-                            print(f"{'='*70}")
-                            print(f"{exit_msg}")
+                        timestamp = datetime.now().strftime('%H:%M:%S')
+                        print(f"\n{'='*70}")
+                        print(f"[{timestamp}] 🔴 TRAILING STOP EXIT - {symbol}")
+                        print(f"{'='*70}")
+                        print(f"Peak gain: +{peak_gain_pct:.1f}% | {exit_msg}")
+                        
+                        # CRITICAL: Cancel existing bracket orders FIRST to prevent race condition
+                        # If we don't cancel them, they might fill while we're placing dynamic exit
+                        if symbol in app.profit_order_id:
+                            app.cancelOrder(app.profit_order_id[symbol])
+                            print(f"Cancelled profit order {app.profit_order_id[symbol]}")
+                        if symbol in app.stop_order_id:
+                            app.cancelOrder(app.stop_order_id[symbol])
+                            print(f"Cancelled stop order {app.stop_order_id[symbol]}")
+                        time.sleep(0.5)  # Brief pause for cancellations to process
+                        
+                        # Place exit order (limit in premarket, market in regular hours)
+                        if is_premarket():
+                            # Get current bid
+                            if symbol in app.bid_price:
+                                del app.bid_price[symbol]
+                            app.reqMktData(1, contracts[symbol], "", False, False, [])
+                            time.sleep(2)
+                            app.cancelMktData(1)
                             
-                            # In pre-market, use limit order at bid; in regular hours, use market order
-                            if is_premarket():
-                                print(f"Pre-market: Placing limit sell at bid...")
-                                
-                                # Get current bid
-                                if symbol in app.bid_price:
-                                    del app.bid_price[symbol]
-                                app.reqMktData(1, contracts[symbol], "", False, False, [])
-                                time.sleep(2)
-                                app.cancelMktData(1)
-                                
-                                if symbol in app.bid_price and app.bid_price[symbol] is not None:
-                                    exit_order = Order()
-                                    exit_order.action = "SELL"
-                                    exit_order.orderType = "LMT"
-                                    exit_order.lmtPrice = app.bid_price[symbol]
-                                    exit_order.totalQuantity = app.position[symbol]
-                                    exit_order.tif = "DAY"
-                                    exit_order.transmit = True  # Fully automatic execution
-                                    
-                                    exit_id = app.nextOid()
-                                    exit_order.orderId = exit_id
-                                    app.placeOrder(exit_order.orderId, contracts[symbol], exit_order)
-                                    print(f"Limit sell order placed: {app.position[symbol]} shares @ ${app.bid_price[symbol]}")
-                            else:
-                                # Regular hours: Place dynamic exit order in SAME OCA group as brackets
-                                # IBKR will automatically cancel profit/stop when this fills
-                                print(f"Regular hours: Placing market exit in OCA group (auto-cancels brackets)...")
-                                
+                            if symbol in app.bid_price and app.bid_price[symbol] is not None:
                                 exit_order = Order()
                                 exit_order.action = "SELL"
-                                exit_order.orderType = "MKT"
+                                exit_order.orderType = "LMT"
+                                exit_order.lmtPrice = app.bid_price[symbol]
                                 exit_order.totalQuantity = app.position[symbol]
                                 exit_order.tif = "DAY"
-                                exit_order.transmit = True  # Fully automatic execution
-                                
-                                # Join the same OCA group as profit/stop orders
-                                if symbol in app.oca_group:
-                                    exit_order.ocaGroup = app.oca_group[symbol]
-                                    exit_order.ocaType = 1  # Cancel all remaining orders on fill
-                                    print(f"  → Using OCA group: {app.oca_group[symbol]}")
-                                    print(f"  → When this fills, IBKR will auto-cancel profit (${app.profit_target_price.get(symbol, 0):.2f}) and stop (${app.stop_price.get(symbol, 0):.2f})")
+                                exit_order.outsideRth = True
+                                exit_order.transmit = True
                                 
                                 exit_id = app.nextOid()
                                 exit_order.orderId = exit_id
                                 app.placeOrder(exit_order.orderId, contracts[symbol], exit_order)
-                                print(f"Market exit order placed: {app.position[symbol]} shares @ MKT")
-                            print(f"{'='*70}\n")
+                                print(f"Exit order placed: LIMIT SELL {app.position[symbol]} shares @ ${app.bid_price[symbol]}")
                         else:
-                            # Bracket orders already executed - position likely already closed
-                            print(f"[INFO] Dynamic exit detected for {symbol}, but bracket orders already inactive. Position likely closed by stop/profit.")
+                            # Regular hours: Market order
+                            exit_order = Order()
+                            exit_order.action = "SELL"
+                            exit_order.orderType = "MKT"
+                            exit_order.totalQuantity = app.position[symbol]
+                            exit_order.tif = "DAY"
+                            exit_order.transmit = True
+                            
+                            exit_id = app.nextOid()
+                            exit_order.orderId = exit_id
+                            app.placeOrder(exit_order.orderId, contracts[symbol], exit_order)
+                            print(f"Exit order placed: MARKET SELL {app.position[symbol]} shares")
+                        
+                        print(f"{'='*70}\n")
                         
                         # Update position tracking AFTER order is placed
                         app.in_position[symbol] = False
@@ -1305,6 +1355,10 @@ if __name__ == "__main__":
                             del app.stop_price[symbol]
                         if symbol in app.profit_target_price:
                             del app.profit_target_price[symbol]
+                        if symbol in app.entry_timestamp:
+                            del app.entry_timestamp[symbol]
+                        if symbol in app.highest_high_since_entry:
+                            del app.highest_high_since_entry[symbol]
                         time.sleep(2)
             
             # Wait 3 seconds before next check
